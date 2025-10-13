@@ -33,6 +33,7 @@ function parseArgs() {
     if (a === '--workspaceId') out.workspaceId = args[++i];
     else if (a === '--spreadsheetId') out.spreadsheetId = args[++i];
     else if (a === '--token') out.token = args[++i];
+    else if (a === '--targetBase') out.targetBase = args[++i];
     else if (a === '--recreate') out.recreate = true;
   }
   return out;
@@ -96,7 +97,19 @@ async function recreateWebhook(oldGid, wh, token, spreadsheetId, sheets) {
   } catch (err) { /* ignore */ }
 
   const clientId = `client-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
-  const target = new URL(wh.target);
+  // Allow overriding base target (useful when Asana stored an old deployment URL)
+  let target;
+  if (process.overrideTargetBase || process.overrideTargetBase === undefined) {
+    // noop to placate some linters
+  }
+  const base = (globalThis.importArgs && importArgs.targetBase) || process.env.TARGET_BASE || null;
+  if (base) {
+    // Construct from provided base
+    const baseUrl = base.endsWith('/') ? base.slice(0, -1) : base;
+    target = new URL(baseUrl + '/api/webhook');
+  } else {
+    target = new URL(wh.target);
+  }
   target.searchParams.set('sheetId', spreadsheetId);
   target.searchParams.set('clientWebhookId', clientId);
 
@@ -137,6 +150,8 @@ async function recreateWebhook(oldGid, wh, token, spreadsheetId, sheets) {
 
 async function main() {
   const args = parseArgs();
+  // Make args available to recreateWebhook
+  global.importArgs = args;
   const workspaceId = args.workspaceId || process.env.ASANA_WORKSPACE_ID;
   const spreadsheetId = args.spreadsheetId;
   const token = args.token || process.env.ASANA_ACCESS_TOKEN;
