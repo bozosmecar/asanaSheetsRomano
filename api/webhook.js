@@ -120,6 +120,9 @@ export default async function handler(req, res) {
       if (!sheetId) {
         console.log('No sheetId provided; skipping secret persistence');
         res.statusCode = 200;
+        // Add a handler version header so we can verify deployed code
+        const hv = process.env.WEBHOOK_HANDLER_VERSION || new Date().toISOString();
+        res.setHeader('X-Webhook-Handler-Version', hv);
         res.end('Handshake OK (no sheetId)');
         return;
       }
@@ -132,6 +135,9 @@ export default async function handler(req, res) {
       }
 
       res.statusCode = 200;
+      // Expose handler version to help confirm the deployment that answered the request
+      const handlerVersion = process.env.WEBHOOK_HANDLER_VERSION || new Date().toISOString();
+      res.setHeader('X-Webhook-Handler-Version', handlerVersion);
       res.end('Handshake OK (persist attempt completed)');
       return;
     }

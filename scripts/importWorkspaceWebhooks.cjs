@@ -108,12 +108,15 @@ async function recreateWebhook(oldGid, wh, token, spreadsheetId, sheets) {
   await appendOrUpdate(sheets, spreadsheetId, newGid, '<pending-secret>');
 
   // poll for the clientId row to be populated (handler should write it)
-  const maxWait = 20000; let waited = 0; const poll = 1500; let captured = null;
+  const maxWait = 60000; let waited = 0; const poll = 2000; let captured = null;
   while (waited < maxWait) {
     const resp = await sheets.spreadsheets.values.get({ spreadsheetId, range: 'webhook_secrets!A2:B' }).catch(() => ({ data: { values: [] } }));
     const rows = resp.data.values || [];
     const clientRow = rows.find(r => r[0] === clientId);
     if (clientRow && clientRow[1] && clientRow[1] !== '<pending-secret>') { captured = clientRow[1]; break; }
+    // also check if the newGid's row was directly updated
+    const gidRow = rows.find(r => r[0] === newGid && r[1] && r[1] !== '<pending-secret>');
+    if (gidRow) { captured = gidRow[1]; break; }
     await new Promise(r => setTimeout(r, poll)); waited += poll;
   }
 
