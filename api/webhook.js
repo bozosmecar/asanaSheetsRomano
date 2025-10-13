@@ -102,8 +102,9 @@ export default async function handler(req, res) {
     const full = new URL(req.url || '/', base);
     const sheetId = full.searchParams.get('sheetId') || process.env.SPREADSHEET_ID || process.env.GOOGLE_SHEETS_SPREADSHEET_ID;
 
-    const hookSecret = req.headers['x-hook-secret'];
-    const webhookIdHeader = req.headers['x-hook-id'] || req.headers['x-hook-gid'] || full.searchParams.get('webhookId');
+  const hookSecret = req.headers['x-hook-secret'];
+  // Support multiple ways to identify webhook: explicit header, or query params
+  const webhookIdHeader = req.headers['x-hook-id'] || req.headers['x-hook-gid'] || full.searchParams.get('webhookId') || full.searchParams.get('clientWebhookId');
 
     if (hookSecret) {
       // Echo immediate handshake header per Asana requirement

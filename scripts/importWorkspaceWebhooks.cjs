@@ -1,20 +1,29 @@
-#!/usr/bin/env node
-/**
- * scripts/importWorkspaceWebhooks.cjs
- * Lists all webhooks for an Asana workspace and writes webhook_id and secret
- * into the spreadsheet's hidden `webhook_secrets` sheet.
- *
- * Usage:
- * node scripts/importWorkspaceWebhooks.cjs --workspaceId <id> --spreadsheetId <id> [--token <ASANA_TOKEN>]
- *
- * Notes:
- * - If a webhook has no secret exposed via the API, the script will write an empty secret.
- * - To capture secrets you may need to recreate webhooks or trigger handshake requests.
- */
-
+require('dotenv').config();
 const axios = require('axios');
-const { spawnSync } = require('child_process');
+const { google } = require('googleapis');
+const fs = require('fs');
 const path = require('path');
+
+// Retry helper (simple)
+async function retryOperation(operation, maxRetries = 3, baseDelay = 1000) {
+  let lastError;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, baseDelay * Math.pow(2, attempt)));
+      return await operation();
+    } catch (err) {
+      lastError = err;
+      if (err.response?.status === 429) {
+        const retryAfter = parseInt(err.response.headers['retry-after'] || '0') * 1000;
+        const wait = retryAfter > 0 ? retryAfter : baseDelay * Math.pow(2, attempt);
+        await new Promise((r) => setTimeout(r, wait));
+        continue;
+      }
+      if (attempt === maxRetries - 1) throw lastError;
+    }
+  }
+  throw lastError;
+}
 
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -29,73 +38,127 @@ function parseArgs() {
   return out;
 }
 
-async function listWebhooks(workspaceId, token) {
-  const url = 'https://app.asana.com/api/1.0/webhooks';
-  const params = { workspace: workspaceId, opt_fields: 'gid,resource,created_by,target' };
-  const res = await axios.get(url, { headers: { Authorization: `Bearer ${token}` }, params });
-  return res.data.data || [];
+function loadCredentials() {
+  if (process.env.GOOGLE_SHEETS_CREDENTIALS) {
+    try { return JSON.parse(process.env.GOOGLE_SHEETS_CREDENTIALS); } catch (e) { throw new Error('Invalid GOOGLE_SHEETS_CREDENTIALS'); }
+  }
+  const fallback = path.join(__dirname, '..', 'asanaromano-cbfe64665e8e.json');
+  if (fs.existsSync(fallback)) return JSON.parse(fs.readFileSync(fallback, 'utf8'));
+  throw new Error('No Google Sheets credentials found');
 }
 
-function storeRowViaStoreSecret(spreadsheetId, webhookId, secret) {
-  // reuse storeSecret.cjs as a subprocess to avoid module loader conflicts
-  const script = path.join(__dirname, 'storeSecret.cjs');
-  const args = ['--secret', secret || '', '--webhookId', webhookId, '--spreadsheetId', spreadsheetId];
-  const r = spawnSync(process.execPath, [script, ...args], { stdio: 'inherit' });
-  return r.status === 0;
+async function getSheetsClient() {
+  const creds = loadCredentials();
+  const client = new google.auth.JWT({ email: creds.client_email, key: creds.private_key, scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
+  await client.authorize();
+  return google.sheets({ version: 'v4', auth: client });
+}
+
+async function ensureSecretsSheet(sheets, spreadsheetId) {
+  const meta = await sheets.spreadsheets.get({ spreadsheetId });
+  const has = meta.data.sheets.some(s => s.properties.title === 'webhook_secrets');
+  if (!has) {
+    await sheets.spreadsheets.batchUpdate({ spreadsheetId, resource: { requests: [{ addSheet: { properties: { title: 'webhook_secrets', hidden: true } } }] } });
+    await sheets.spreadsheets.values.update({ spreadsheetId, range: 'webhook_secrets!A1:B1', valueInputOption: 'RAW', resource: { values: [['webhook_id','secret']] } });
+  }
+}
+
+async function appendOrUpdate(sheets, spreadsheetId, webhookId, secret) {
+  await ensureSecretsSheet(sheets, spreadsheetId);
+  const resp = await sheets.spreadsheets.values.get({ spreadsheetId, range: 'webhook_secrets!A2:B' }).catch(() => ({ data: { values: [] } }));
+  const rows = resp.data.values || [];
+  const idx = rows.findIndex(r => r[0] === webhookId);
+  if (idx !== -1) {
+    const rowNum = idx + 2;
+    await sheets.spreadsheets.values.update({ spreadsheetId, range: `webhook_secrets!A${rowNum}:B${rowNum}`, valueInputOption: 'RAW', resource: { values: [[webhookId, secret]] } });
+    return { updated: true, row: rowNum };
+  }
+  await sheets.spreadsheets.values.append({ spreadsheetId, range: 'webhook_secrets!A:B', valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS', resource: { values: [[webhookId, secret]] } });
+  return { appended: true };
+}
+
+async function listWebhooks(workspaceId, token) {
+  const url = 'https://app.asana.com/api/1.0/webhooks';
+  const webhooks = [];
+  let offset = null;
+  do {
+    const params = { workspace: workspaceId, limit: 100, ...(offset ? { offset } : {}), opt_fields: 'gid,resource,target' };
+    const resp = await retryOperation(() => axios.get(url, { headers: { Authorization: `Bearer ${token}` }, params }));
+    webhooks.push(...(resp.data.data || []));
+    offset = resp.data.next_page?.offset;
+  } while (offset);
+  return webhooks;
+}
+
+async function recreateWebhook(oldGid, wh, token, spreadsheetId, sheets) {
+  try {
+    await retryOperation(() => axios.delete(`https://app.asana.com/api/1.0/webhooks/${oldGid}`, { headers: { Authorization: `Bearer ${token}` } }));
+  } catch (err) { /* ignore */ }
+
+  const clientId = `client-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+  const target = new URL(wh.target);
+  target.searchParams.set('sheetId', spreadsheetId);
+  target.searchParams.set('clientWebhookId', clientId);
+
+  const payload = { data: { resource: wh.resource?.gid || wh.resource, target: target.toString() } };
+  const created = await retryOperation(() => axios.post('https://app.asana.com/api/1.0/webhooks', payload, { headers: { Authorization: `Bearer ${token}` } }));
+  const newGid = created.data.data.gid;
+
+  // append placeholder under the new gid while waiting for secret
+  await appendOrUpdate(sheets, spreadsheetId, newGid, '<pending-secret>');
+
+  // poll for the clientId row to be populated (handler should write it)
+  const maxWait = 20000; let waited = 0; const poll = 1500; let captured = null;
+  while (waited < maxWait) {
+    const resp = await sheets.spreadsheets.values.get({ spreadsheetId, range: 'webhook_secrets!A2:B' }).catch(() => ({ data: { values: [] } }));
+    const rows = resp.data.values || [];
+    const clientRow = rows.find(r => r[0] === clientId);
+    if (clientRow && clientRow[1] && clientRow[1] !== '<pending-secret>') { captured = clientRow[1]; break; }
+    await new Promise(r => setTimeout(r, poll)); waited += poll;
+  }
+
+  if (captured) {
+    // write captured secret under the real GID and remove client row by updating it
+    await appendOrUpdate(sheets, spreadsheetId, newGid, captured);
+    // attempt to delete clientId row (by replacing with blank) — we'll update that row to empty
+    const resp2 = await sheets.spreadsheets.values.get({ spreadsheetId, range: 'webhook_secrets!A2:B' }).catch(() => ({ data: { values: [] } }));
+    const rows2 = resp2.data.values || [];
+    const idx = rows2.findIndex(r => r[0] === clientId);
+    if (idx !== -1) {
+      const rowNum = idx + 2;
+      await sheets.spreadsheets.values.update({ spreadsheetId, range: `webhook_secrets!A${rowNum}:B${rowNum}`, valueInputOption: 'RAW', resource: { values: [['', '']] } });
+    }
+  }
+  return { newGid, captured };
 }
 
 async function main() {
-  const { workspaceId, spreadsheetId, token } = parseArgs();
-  const asanaToken = token || process.env.ASANA_ACCESS_TOKEN;
-  const { recreate } = parseArgs();
-  if (!workspaceId || !spreadsheetId || !asanaToken) {
-    console.error('Usage: node scripts/importWorkspaceWebhooks.cjs --workspaceId <id> --spreadsheetId <id> [--token <ASANA_TOKEN>]');
-    process.exit(2);
-  }
+  const args = parseArgs();
+  const workspaceId = args.workspaceId || process.env.ASANA_WORKSPACE_ID;
+  const spreadsheetId = args.spreadsheetId;
+  const token = args.token || process.env.ASANA_ACCESS_TOKEN;
+  const recreate = !!args.recreate;
+  if (!workspaceId || !spreadsheetId || !token) { console.error('Usage: --workspaceId <id> --spreadsheetId <id> [--token <token>] [--recreate]'); process.exit(2); }
 
+  const sheets = await getSheetsClient();
   console.log(`Listing webhooks for workspace ${workspaceId}...`);
-  let webhooks;
-  try {
-    webhooks = await listWebhooks(workspaceId, asanaToken);
-  } catch (err) {
-    console.error('Error listing webhooks:', err.response?.data || err.message || err);
-    process.exit(1);
-  }
+  const webhooks = await listWebhooks(workspaceId, token);
+  console.log(`Found ${webhooks.length} webhooks`);
 
-  console.log(`Found ${webhooks.length} webhooks. Importing to spreadsheet ${spreadsheetId}...`);
   for (const wh of webhooks) {
     const gid = wh.gid;
-    // Asana doesn't expose handshake secrets via list API. We'll store a placeholder
-    // and optionally recreate the webhook to trigger a handshake (and capture the secret).
-    const placeholder = '<pending-secret>';
-    console.log(`Storing webhook ${gid} (target: ${wh.target}) with placeholder secret`);
-    const ok = storeRowViaStoreSecret(spreadsheetId, gid, placeholder);
-    if (!ok) {
-      console.error(`Failed to store webhook ${gid}`);
-    }
-
+    const target = wh.target;
+    console.log(`Importing webhook ${gid} (target: ${target})`);
+    await appendOrUpdate(sheets, spreadsheetId, gid, '<pending-secret>');
     if (recreate) {
-      try {
-        console.log(`Recreating webhook ${gid} to trigger handshake...`);
-        // Delete existing webhook
-        await axios.delete(`https://app.asana.com/api/1.0/webhooks/${gid}`, { headers: { Authorization: `Bearer ${asanaToken}` } });
-        await new Promise((r) => setTimeout(r, 1000));
-
-        // Create a new webhook with same resource and target
-        const payload = { data: { resource: wh.resource?.gid || wh.resource, target: wh.target } };
-        const created = await axios.post('https://app.asana.com/api/1.0/webhooks', payload, { headers: { Authorization: `Bearer ${asanaToken}` } });
-        console.log(`Recreated webhook ${created.data.data.gid}. Waiting 2s for handshake to be processed by your handler...`);
-        // Give the deployed webhook handler some time to receive and persist the handshake secret
-        await new Promise((r) => setTimeout(r, 2000));
-      } catch (err) {
-        console.error(`Error recreating webhook ${gid}:`, err.response?.data || err.message || err);
-      }
+      console.log(`Recreating ${gid} to capture handshake...`);
+      const res = await recreateWebhook(gid, wh, token, spreadsheetId, sheets);
+      console.log(`Recreated -> ${res.newGid}. secret captured: ${!!res.captured}`);
     }
-    // small delay between webhooks
-    await new Promise((r) => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 500));
   }
 
-  console.log('Import complete. Note: secrets may be empty unless you re-create webhooks to trigger handshakes.');
+  console.log('Import complete.');
 }
 
 if (require.main === module) main();
