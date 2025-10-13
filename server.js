@@ -1,0 +1,215 @@
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const crypto = require("node:crypto");
+const taskRoutes = require("./src/routes/taskRoutes");
+const projectRoutes = require("./src/routes/projectRoutes");
+const {
+  handleWebhookEvent,
+  storeWebhookSecret,
+  getWebhookSecrets,
+} = require("./src/config/webhookHandler");
+const { getGoogleSheetsClient } = require("./src/config/googleSheets");
+
+const app = express();
+const port = process.env.PORT || 3000;
+
+// Rate limiter for Google Sheets API
+// Helps prevent 429 "Quota exceeded" errors
+const sheetsRateLimiter = {
+  queue: [],
+  processing: false,
+  requestsPerMinute: 60, // Conservative limit
+  minDelayMs: 1000, // Minimum 1s between requests
+
+  // Add an operation to the queue
+  enqueue(operation) {
+    return new Promise((resolve, reject) => {
+      this.queue.push({ operation, resolve, reject });
+      this.processQueue();
+    });
+  },
+
+  // Process the next operation in the queue
+  async processQueue() {
+    if (this.processing || this.queue.length === 0) return;
+
+    this.processing = true;
+    const { operation, resolve, reject } = this.queue.shift();
+
+    try {
+      console.log(
+        `Processing Google Sheets API request. Queue length: ${this.queue.length}`
+      );
+      const result = await operation();
+      resolve(result);
+    } catch (error) {
+      console.error("Error in Google Sheets operation:", error.message);
+
+      // If rate limited, add back to queue with exponential backoff
+      if (error.code === 429) {
+        console.log("Google Sheets API rate limited. Retrying with backoff...");
+        // Wait longer and retry
+        setTimeout(() => {
+          this.queue.unshift({ operation, resolve, reject });
+        }, 5000 + Math.random() * 5000); // 5-10s backoff
+      } else {
+        reject(error);
+      }
+    } finally {
+      // Wait before processing next request
+      setTimeout(() => {
+        this.processing = false;
+        this.processQueue();
+      }, this.minDelayMs);
+    }
+  },
+};
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Routes
+app.get("/", (req, res) => {
+  res.json({ message: "Welcome to the Node.js Backend API" });
+});
+
+// Webhook endpoint
+app.post("/receiveWebhook", async (req, res) => {
+  try {
+    // Get the spreadsheet ID from the query parameter
+    const spreadsheetId = req.query.sheetId;
+    if (!spreadsheetId) {
+      console.error("No spreadsheet ID provided in webhook URL");
+      return res.sendStatus(400);
+    }
+
+    const sheets = await getGoogleSheetsClient();
+
+    if (req.headers["x-hook-secret"]) {
+      // This is a new webhook handshake
+      console.log("Receiving new webhook handshake");
+      const hookSecret = req.headers["x-hook-secret"];
+      const webhookId = req.body.data?.id;
+
+      // Store the secret in Google Sheets with rate limiting
+      try {
+        await sheetsRateLimiter.enqueue(async () => {
+          return await storeWebhookSecret(
+            sheets,
+            webhookId,
+            hookSecret,
+            spreadsheetId
+          );
+        });
+
+        // Echo back the secret
+        res.setHeader("X-Hook-Secret", hookSecret);
+        res.sendStatus(200);
+        console.log("Webhook handshake completed successfully");
+      } catch (error) {
+        console.error("Failed to store webhook secret:", error);
+        res.status(500).send("Failed to store webhook secret");
+      }
+    } else if (req.headers["x-hook-signature"]) {
+      // This is a webhook event
+      const signature = req.headers["x-hook-signature"];
+      const body = JSON.stringify(req.body);
+
+      // Get all webhook secrets from Google Sheets with rate limiting
+      let webhookSecrets;
+      try {
+        webhookSecrets = await sheetsRateLimiter.enqueue(async () => {
+          return await getWebhookSecrets(sheets, spreadsheetId);
+        });
+      } catch (error) {
+        console.error("Failed to get webhook secrets:", error);
+        return res.status(500).send("Failed to verify webhook signature");
+      }
+
+      let isValid = false;
+
+      // Try all stored secrets
+      for (const [secret] of webhookSecrets) {
+        const computedSignature = crypto
+          .createHmac("SHA256", secret)
+          .update(body)
+          .digest("hex");
+
+        if (computedSignature === signature) {
+          isValid = true;
+          break;
+        }
+      }
+
+      if (!isValid) {
+        console.log("Invalid webhook signature");
+        return res.sendStatus(401);
+      }
+
+      // Valid signature - send 200 response immediately
+      res.sendStatus(200);
+
+      console.log(`Processing webhook events at ${new Date().toISOString()}`);
+
+      // Process events asynchronously (don't block response)
+      if (req.body.events && Array.isArray(req.body.events)) {
+        // Process one event at a time to avoid rate limits
+        const processEvents = async () => {
+          for (const event of req.body.events) {
+            try {
+              console.log("Processing event:", event);
+              await sheetsRateLimiter.enqueue(async () => {
+                return await handleWebhookEvent(event, spreadsheetId);
+              });
+            } catch (error) {
+              console.error("Error processing event:", error);
+              // Continue with other events even if one fails
+            }
+          }
+        };
+
+        // Start processing events without blocking response
+        processEvents().catch((err) => {
+          console.error("Failed to process events:", err);
+        });
+      }
+    } else {
+      console.error("Invalid webhook request - missing required headers");
+      res.sendStatus(400);
+    }
+  } catch (error) {
+    console.error("Error handling webhook:", error);
+    res.sendStatus(500);
+  }
+});
+
+// Task routes
+app.use("/api/tasks", taskRoutes);
+
+// Project routes
+app.use("/api/projects", projectRoutes);
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error("Server error:", err.stack);
+  res.status(500).json({
+    error: "Something went wrong!",
+    message: err.message,
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    error: "Not Found",
+    message: "The requested resource was not found",
+  });
+});
+
+// Start server
+app.listen(port, () => {
+  console.log(`Server is running on port ${port}`);
+});
