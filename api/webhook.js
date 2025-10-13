@@ -107,25 +107,32 @@ export default async function handler(req, res) {
   const webhookIdHeader = req.headers['x-hook-id'] || req.headers['x-hook-gid'] || full.searchParams.get('webhookId') || full.searchParams.get('clientWebhookId');
 
     if (hookSecret) {
+      // Debug: log incoming headers and query param extraction
+      console.log('Incoming handshake. headers:', req.headers);
+      console.log('Parsed sheetId:', sheetId, 'webhookIdHeader:', webhookIdHeader);
+
       // Echo immediate handshake header per Asana requirement
       res.setHeader('X-Hook-Secret', hookSecret);
 
-      // Persist in background (don't block the handshake response)
-      (async () => {
-        try {
-          const webhookId = webhookIdHeader || `asana-${Date.now()}`;
-          if (!sheetId) {
-            console.log('No sheetId provided; skipping secret persistence');
-            return;
-          }
-          await persistHookSecret(sheetId, webhookId, hookSecret);
-        } catch (err) {
-          console.error('Background persist error:', err.message || err);
-        }
-      })();
+      // IMPORTANT: On serverless platforms (Vercel), background promises may be terminated
+      // when the function returns. Await persistence so the write completes before returning.
+      const webhookId = webhookIdHeader || `asana-${Date.now()}`;
+      if (!sheetId) {
+        console.log('No sheetId provided; skipping secret persistence');
+        res.statusCode = 200;
+        res.end('Handshake OK (no sheetId)');
+        return;
+      }
+
+      try {
+        await persistHookSecret(sheetId, webhookId, hookSecret);
+        console.log('Persisted hook secret for', webhookId);
+      } catch (err) {
+        console.error('Error persisting hook secret (will still respond 200):', err.message || err);
+      }
 
       res.statusCode = 200;
-      res.end('Handshake OK (persist attempt initiated)');
+      res.end('Handshake OK (persist attempt completed)');
       return;
     }
 
