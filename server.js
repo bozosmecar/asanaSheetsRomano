@@ -165,7 +165,7 @@ app.post("/receiveWebhook", async (req, res) => {
         console.error("Failed to get webhook secrets:", error);
         return res.status(500).send("Failed to verify webhook signature");
       }
-
+// Verify the signature against all stored secrets
       let isValid = false;
 
       // Try all stored secrets
