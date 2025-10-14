@@ -1,6 +1,21 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+// Ensure a fetch implementation is available for google libraries that require it
+try {
+  if (typeof globalThis.fetch === "undefined") {
+    // node-fetch v2 uses CommonJS; require it and assign to globalThis.fetch
+    // This will throw if node-fetch isn't installed, but that's fine — it will
+    // cause a clearer error during deploy. When installed, this ensures the
+    // module is bundled and available at runtime.
+    // eslint-disable-next-line global-require
+    globalThis.fetch = require("node-fetch");
+    console.log("FETCH SHIM: node-fetch loaded and assigned to globalThis.fetch");
+  }
+} catch (e) {
+  console.warn("FETCH SHIM: unable to load node-fetch:", e && e.message);
+}
+
 const crypto = require("node:crypto");
 const taskRoutes = require("./src/routes/taskRoutes");
 const projectRoutes = require("./src/routes/projectRoutes");
