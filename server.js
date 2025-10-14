@@ -14,6 +14,28 @@ const { getGoogleSheetsClient } = require("./src/config/googleSheets");
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Startup environment quick-checks (safe, no secrets logged)
+try {
+  console.log('ENV CHECK: ASANA_ACCESS_TOKEN present:', !!process.env.ASANA_ACCESS_TOKEN);
+  console.log('ENV CHECK: ASANA_WORKSPACE_ID present:', !!process.env.ASANA_WORKSPACE_ID);
+  console.log('ENV CHECK: GOOGLE_DRIVE_FOLDER_ID present:', !!process.env.GOOGLE_DRIVE_FOLDER_ID);
+  console.log('ENV CHECK: ASANA_WEBHOOK_TARGET present:', !!process.env.ASANA_WEBHOOK_TARGET);
+
+  // Try to parse GOOGLE_SHEETS_CREDENTIALS safely to catch JSON issues early
+  if (process.env.GOOGLE_SHEETS_CREDENTIALS) {
+    try {
+      JSON.parse(process.env.GOOGLE_SHEETS_CREDENTIALS);
+      console.log('ENV CHECK: GOOGLE_SHEETS_CREDENTIALS JSON: OK');
+    } catch (e) {
+      console.error('ENV CHECK ERROR: GOOGLE_SHEETS_CREDENTIALS JSON parse failed:', e.message);
+    }
+  } else {
+    console.log('ENV CHECK: GOOGLE_SHEETS_CREDENTIALS present: false');
+  }
+} catch (err) {
+  console.error('ENV CHECK unexpected error:', err && err.message);
+}
+
 // Rate limiter for Google Sheets API
 // Helps prevent 429 "Quota exceeded" errors
 const sheetsRateLimiter = {
